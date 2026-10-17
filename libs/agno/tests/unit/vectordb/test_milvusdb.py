@@ -1,5 +1,5 @@
 from typing import List
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -750,3 +750,40 @@ def test_decode_json_field_helper():
     assert Milvus._decode_json_field(None, default={}) == {}
     assert Milvus._decode_json_field("", default={}) == {}
     assert Milvus._decode_json_field("not json", default={"fallback": True}) == {"fallback": True}
+
+
+def _failing_embedder():
+    failing = MagicMock()
+    failing.enable_batch = False
+
+    async def failing_embed(_text):
+        raise RuntimeError("embedder down")
+
+    failing.async_get_embedding_and_usage = failing_embed
+    return failing
+
+
+async def test_async_upsert_embeds_before_delete(milvus_db, sample_documents):
+    """async_upsert must not delete old chunks when the embedder fails (agno-agi/agno#11123)."""
+    milvus_db.embedder = _failing_embedder()
+    milvus_db._async_client = AsyncMock()
+    with (
+        patch.object(milvus_db, "content_hash_exists", return_value=True),
+        patch.object(milvus_db, "_delete_by_content_hash") as mock_delete,
+    ):
+        with pytest.raises(RuntimeError, match="embedder down"):
+            await milvus_db.async_upsert(content_hash="hash", documents=sample_documents)
+        mock_delete.assert_not_called()
+
+
+async def test_async_upsert_deletes_after_successful_embed(milvus_db, sample_documents):
+    """async_upsert deletes the replaced chunks once the new embeddings exist (agno-agi/agno#11123)."""
+    milvus_db._async_client = AsyncMock()
+    with (
+        patch.object(milvus_db, "content_hash_exists", return_value=True),
+        patch.object(milvus_db, "_delete_by_content_hash") as mock_delete,
+    ):
+        await milvus_db.async_upsert(content_hash="hash", documents=sample_documents)
+        mock_delete.assert_called_once_with("hash", None)
+        assert all(doc.embedding is not None for doc in sample_documents)
+        assert milvus_db._async_client.upsert.await_count == len(sample_documents)

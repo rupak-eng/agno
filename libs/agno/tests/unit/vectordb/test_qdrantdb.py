@@ -1,6 +1,6 @@
 import asyncio
 from typing import List
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -540,3 +540,36 @@ async def test_concurrent_async_searches_no_blocking(tracking_embedder):
     # All should use async embedder
     assert tracking_embedder.async_call_count == 5, "async_get_embedding should be called 5 times"
     assert tracking_embedder.sync_call_count == 0, "sync get_embedding should NOT be called"
+
+
+async def test_async_upsert_embeds_before_delete(qdrant_db, sample_documents):
+    """async_upsert must not delete old chunks when the embedder fails (agno-agi/agno#11123)."""
+    failing_embedder = MagicMock()
+    failing_embedder.enable_batch = False
+
+    async def failing_embed(_text):
+        raise RuntimeError("embedder down")
+
+    failing_embedder.async_get_embedding_and_usage = failing_embed
+    qdrant_db.embedder = failing_embedder
+    with (
+        patch.object(qdrant_db, "content_hash_exists", return_value=True),
+        patch.object(qdrant_db, "_delete_by_content_hash") as mock_delete,
+        patch.object(qdrant_db, "async_insert", new=AsyncMock()),
+    ):
+        with pytest.raises(RuntimeError, match="embedder down"):
+            await qdrant_db.async_upsert(content_hash="hash", documents=sample_documents)
+        mock_delete.assert_not_called()
+
+
+async def test_async_upsert_deletes_after_successful_embed(qdrant_db, sample_documents):
+    """async_upsert deletes the replaced chunks once the new embeddings exist (agno-agi/agno#11123)."""
+    with (
+        patch.object(qdrant_db, "content_hash_exists", return_value=True),
+        patch.object(qdrant_db, "_delete_by_content_hash") as mock_delete,
+        patch.object(qdrant_db, "async_insert", new=AsyncMock()) as mock_insert,
+    ):
+        await qdrant_db.async_upsert(content_hash="hash", documents=sample_documents)
+        mock_delete.assert_called_once_with("hash", None)
+        mock_insert.assert_called_once()
+        assert all(doc.embedding is not None for doc in sample_documents)

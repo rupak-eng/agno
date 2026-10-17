@@ -751,3 +751,43 @@ async def test_async_search_uses_async_embedder(
         # Verify async embedder was called, not sync
         assert tracking_embedder.async_call_count == 1, "async_get_embedding should be called once"
         assert tracking_embedder.sync_call_count == 0, "sync get_embedding should NOT be called"
+
+
+def _failing_embedder() -> MagicMock:
+    failing = MagicMock()
+    failing.enable_batch = False
+    failing.async_get_embedding = AsyncMock(side_effect=RuntimeError("embedder down"))
+    failing.async_get_embedding_and_usage = AsyncMock(side_effect=RuntimeError("embedder down"))
+    return failing
+
+
+def _sample_documents() -> List[Document]:
+    return [
+        Document(content="Tom Kha Gai is a Thai coconut soup with chicken", name="tom_kha"),
+        Document(content="Pad Thai is a stir-fried rice noodle dish", name="pad_thai"),
+    ]
+
+
+async def test_async_upsert_embeds_before_delete(async_vector_db: MongoVectorDb) -> None:
+    """async_upsert must not delete old chunks when the embedder fails (agno-agi/agno#11123)."""
+    async_vector_db.embedder = _failing_embedder()
+    with (
+        patch.object(async_vector_db, "content_hash_exists", return_value=True),
+        patch.object(async_vector_db, "_delete_by_content_hash") as mock_delete,
+    ):
+        with pytest.raises(RuntimeError, match="embedder down"):
+            await async_vector_db.async_upsert(content_hash="hash", documents=_sample_documents())
+        mock_delete.assert_not_called()
+
+
+async def test_async_upsert_deletes_after_successful_embed(async_vector_db: MongoVectorDb) -> None:
+    """async_upsert deletes the replaced chunks once the new embeddings exist (agno-agi/agno#11123)."""
+    documents = _sample_documents()
+    with (
+        patch.object(async_vector_db, "content_hash_exists", return_value=True),
+        patch.object(async_vector_db, "_delete_by_content_hash") as mock_delete,
+    ):
+        await async_vector_db.async_upsert(content_hash="hash", documents=documents)
+        mock_delete.assert_called_once_with("hash", None)
+        assert all(doc.embedding is not None for doc in documents)
+        assert async_vector_db._async_collection.update_one.await_count == len(documents)

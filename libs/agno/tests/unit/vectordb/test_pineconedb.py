@@ -375,8 +375,9 @@ async def test_async_upsert(mock_pinecone_db, mock_embedder):
         # Call the method
         await mock_pinecone_db.async_upsert(documents=docs, content_hash="test_hash")
 
-        # Verify gather was called
-        gather_mock.assert_called_once()
+        # Verify gather was called: once by the embed-before-delete guard
+        # (aembed_before_replace) and once for the batch fan-out below.
+        assert gather_mock.call_count == 2
 
         # Verify to_thread was called for upsert_vectors
         to_thread_mock.assert_any_call(
@@ -615,3 +616,39 @@ def test_delete_by_metadata_complex(mock_pinecone_db):
         result = mock_pinecone_db.delete_by_metadata({"spicy": False})
         assert result is True
         mock_delete_by_metadata.assert_called_once_with({"spicy": False})
+
+
+def _failing_embedder() -> MagicMock:
+    failing = MagicMock()
+    failing.enable_batch = False
+    failing.async_get_embedding_and_usage = AsyncMock(side_effect=RuntimeError("embedder down"))
+    return failing
+
+
+async def test_async_upsert_embeds_before_delete(mock_pinecone_db):
+    """async_upsert must not delete old chunks when the embedder fails (agno-agi/agno#11123)."""
+    mock_pinecone_db.embedder = _failing_embedder()
+    with (
+        patch.object(mock_pinecone_db, "content_hash_exists", return_value=True),
+        patch.object(mock_pinecone_db, "_delete_by_content_hash") as mock_delete,
+        patch.object(mock_pinecone_db, "_prepare_vectors", new=AsyncMock(return_value=[{}])),
+        patch.object(mock_pinecone_db, "_upsert_vectors"),
+    ):
+        with pytest.raises(RuntimeError, match="embedder down"):
+            await mock_pinecone_db.async_upsert(documents=create_test_documents(2), content_hash="test_hash")
+        mock_delete.assert_not_called()
+
+
+async def test_async_upsert_deletes_after_successful_embed(mock_pinecone_db):
+    """async_upsert deletes the replaced chunks once the new embeddings exist (agno-agi/agno#11123)."""
+    docs = create_test_documents(2)
+    with (
+        patch.object(mock_pinecone_db, "content_hash_exists", return_value=True),
+        patch.object(mock_pinecone_db, "_delete_by_content_hash") as mock_delete,
+        patch.object(mock_pinecone_db, "_prepare_vectors", new=AsyncMock(return_value=[{}])),
+        patch.object(mock_pinecone_db, "_upsert_vectors") as mock_upsert_vectors,
+    ):
+        await mock_pinecone_db.async_upsert(documents=docs, content_hash="test_hash")
+        mock_delete.assert_called_once_with("test_hash", None)
+        mock_upsert_vectors.assert_called_once()
+        assert all(doc.embedding is not None for doc in docs)

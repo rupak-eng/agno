@@ -14,7 +14,13 @@ from agno.knowledge.document import Document
 from agno.knowledge.embedder import Embedder
 from agno.knowledge.reranker.base import Reranker
 from agno.utils.log import log_debug, log_error, log_info, log_warning
-from agno.vectordb.base import VectorDb, embed_before_replace, is_rate_limit_error, raise_embedding_failures
+from agno.vectordb.base import (
+    VectorDb,
+    aembed_before_replace,
+    embed_before_replace,
+    is_rate_limit_error,
+    raise_embedding_failures,
+)
 from agno.vectordb.distance import Distance
 from agno.vectordb.search import SearchType
 
@@ -782,6 +788,10 @@ class Milvus(VectorDb):
         self._validate_user_id(user_id)
         self._require_owner_field(user_id)
         log_debug(f"Upserting {len(documents)} documents asynchronously")
+
+        # Embed before the delete below: clearing the old chunks first would destroy
+        # retrievable content if the embedder then fails.
+        await aembed_before_replace(documents, self.embedder)
 
         # See the matching comment in ``upsert``.
         # Both hit the sync client; off the loop so a slow server cannot stall it.

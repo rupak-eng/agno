@@ -28,7 +28,13 @@ from agno.knowledge.document import Document
 from agno.knowledge.embedder import Embedder
 from agno.knowledge.reranker.base import Reranker
 from agno.utils.log import log_debug, log_error, log_warning, logger
-from agno.vectordb.base import VectorDb, embed_before_replace, is_rate_limit_error, raise_embedding_failures
+from agno.vectordb.base import (
+    VectorDb,
+    aembed_before_replace,
+    embed_before_replace,
+    is_rate_limit_error,
+    raise_embedding_failures,
+)
 from agno.vectordb.search import SearchType
 
 # Pinecone caps ``top_k`` at 10 000 and returns no cursor, so filtered reads page by
@@ -337,6 +343,9 @@ class PineconeDb(VectorDb):
         user_id: Optional[str] = None,
     ) -> None:
         """Upsert documents into the index asynchronously with batching."""
+        # Embed before the delete below: clearing the old chunks first would destroy
+        # retrievable content if the embedder then fails.
+        await aembed_before_replace(documents, self.embedder)
         if self.content_hash_exists(content_hash, user_id=user_id):
             await asyncio.to_thread(self._delete_by_content_hash, content_hash, user_id)
         if not documents:
