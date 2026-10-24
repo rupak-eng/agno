@@ -285,6 +285,29 @@ class TestStepOutputReviewSync:
         # Should NOT pause because output does not contain "error"
         assert run.status == RunStatus.completed
 
+    def test_predicate_exception_fails_closed(self, shared_db):
+        # agno#11284: a raising predicate must pause for review (fail closed),
+        # not silently skip the output-review gate.
+        def bad_predicate(output: StepOutput) -> bool:
+            raise RuntimeError("user predicate bug")
+
+        wf = Workflow(
+            name="Predicate Exception",
+            db=shared_db,
+            steps=[
+                Step(
+                    name="guarded",
+                    executor=quick_analysis,
+                    human_review=HumanReview(requires_output_review=bad_predicate),
+                ),
+                Step(name="finalize", executor=finalize),
+            ],
+        )
+
+        run = wf.run("test")
+        assert run.is_paused
+        assert len(run.steps_requiring_output_review) == 1
+
     def test_max_retries_cancels(self, shared_db):
         wf = Workflow(
             name="Step Max Retries",

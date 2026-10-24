@@ -21,6 +21,7 @@ from agno.workflow.types import (
     StepOutput,
     StepRequirement,
 )
+from agno.workflow.utils.hitl import check_output_review_status
 
 # =============================================================================
 # Test OnReject.retry
@@ -838,3 +839,74 @@ class TestRouterOutputReviewAsync:
         run = session.runs[-1]
         assert run.status == RunStatus.completed
         assert "Deep result" in str(run.content)
+
+
+# =============================================================================
+# Output-review predicate exceptions fail closed (agno#11284)
+# =============================================================================
+
+
+class TestOutputReviewPredicateException:
+    """A raising requires_output_review predicate must pause for human review
+    instead of silently disabling the output-review gate."""
+
+    def _guarded_step(self, predicate):
+        def dummy_fn(step_input: StepInput) -> StepOutput:
+            return StepOutput(content="sensitive output")
+
+        return Step(
+            name="guarded",
+            executor=dummy_fn,
+            human_review=HumanReview(requires_output_review=predicate),
+        )
+
+    def test_predicate_exception_fails_closed(self):
+        def bad_predicate(output: StepOutput) -> bool:
+            raise RuntimeError("user predicate bug")
+
+        result = check_output_review_status(
+            self._guarded_step(bad_predicate),
+            0,
+            StepInput(input="go"),
+            StepOutput(content="sensitive output"),
+        )
+        assert result.should_pause is True
+        assert result.step_requirement is not None
+
+    def test_predicate_true_pauses(self):
+        result = check_output_review_status(
+            self._guarded_step(lambda output: True),
+            0,
+            StepInput(input="go"),
+            StepOutput(content="sensitive output"),
+        )
+        assert result.should_pause is True
+
+    def test_predicate_false_skips(self):
+        result = check_output_review_status(
+            self._guarded_step(lambda output: False),
+            0,
+            StepInput(input="go"),
+            StepOutput(content="sensitive output"),
+        )
+        assert result.should_pause is False
+
+    def test_bool_true_still_pauses(self):
+        def dummy_fn(step_input: StepInput) -> StepOutput:
+            return StepOutput(content="x")
+
+        step = Step(
+            name="guarded",
+            executor=dummy_fn,
+            human_review=HumanReview(requires_output_review=True),
+        )
+        result = check_output_review_status(step, 0, StepInput(input="go"), StepOutput(content="x"))
+        assert result.should_pause is True
+
+    def test_no_human_review_skips(self):
+        def dummy_fn(step_input: StepInput) -> StepOutput:
+            return StepOutput(content="x")
+
+        step = Step(name="plain", executor=dummy_fn)
+        result = check_output_review_status(step, 0, StepInput(input="go"), StepOutput(content="x"))
+        assert result.should_pause is False
